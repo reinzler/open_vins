@@ -32,10 +32,24 @@
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
-
+#include <iostream>\n
+#include <cstdlib>
+#include <string>
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+bool glim_openvins_debug_enabled() {
+  const char* v = std::getenv("GLIM_OPENVINS_DEBUG");
+  if (v == nullptr) {
+    return false;
+  }
+  const std::string value(v);
+  return value == "1" || value == "true" || value == "TRUE" || value == "debug" || value == "DEBUG";
+}
+}  // namespace
+
 
 void VioManager::initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate) {
 
@@ -103,7 +117,17 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
     // Try to initialize the system
     // We will wait for a jerk if we do not have the zero velocity update enabled
     // Otherwise we can initialize right away as the zero velocity will handle the stationary case
-    bool wait_for_jerk = (updaterZUPT == nullptr);
+    // GLIM probe:
+    // For simulated UAV bags we often start from a smooth/static segment.
+    // If updaterZUPT is null, upstream OpenVINS waits for a jerk before static init.
+    // Force immediate static initialization attempt for this diagnostic run.
+    bool wait_for_jerk = false;
+    if (glim_openvins_debug_enabled()) {
+      std::cout << "[openvins_init_dbg] force wait_for_jerk=false updaterZUPT_null="
+                << (updaterZUPT == nullptr)
+                << std::endl;
+    }
+
     bool success = initializer->initialize(timestamp, covariance, order, state->_imu, wait_for_jerk);
 
     // If we have initialized successfully we will set the covariance and state elements as needed

@@ -42,10 +42,25 @@
 #include "update/UpdaterMSCKF.h"
 #include "update/UpdaterSLAM.h"
 #include "update/UpdaterZeroVelocity.h"
+#include <iostream>
+#include <cstdlib>
+#include <string>
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+bool glim_openvins_debug_enabled() {
+  const char* v = std::getenv("GLIM_OPENVINS_DEBUG");
+  if (v == nullptr) {
+    return false;
+  }
+  const std::string value(v);
+  return value == "1" || value == "true" || value == "TRUE" || value == "debug" || value == "DEBUG";
+}
+}  // namespace
+
 
 VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
 
@@ -278,7 +293,36 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Perform our feature tracking!
+  static int glim_track_dbg_count = 0;
+  glim_track_dbg_count++;
+  const bool glim_track_dbg = glim_openvins_debug_enabled() && (glim_track_dbg_count <= 20 || glim_track_dbg_count % 50 == 0);
+
+  if (glim_track_dbg) {
+    std::cout << "[openvins_track_dbg] before_tracking count=" << glim_track_dbg_count
+              << " msg_t=" << message.timestamp
+              << " sensor_ids=" << message.sensor_ids.size()
+              << " images=" << message.images.size()
+              << " masks=" << message.masks.size()
+              << " db_features=" << trackFEATS->get_feature_database()->get_internal_data().size();
+
+    if (!message.sensor_ids.empty()) {
+      std::cout << " sensor_id0=" << message.sensor_ids.front();
+    }
+    if (!message.images.empty()) {
+      std::cout << " image0=" << message.images.front().cols << "x" << message.images.front().rows
+                << " type=" << message.images.front().type()
+                << " channels=" << message.images.front().channels();
+    }
+    std::cout << std::endl;
+  }
+
   trackFEATS->feed_new_camera(message);
+
+  if (glim_track_dbg) {
+    std::cout << "[openvins_track_dbg] after_tracking count=" << glim_track_dbg_count
+              << " db_features=" << trackFEATS->get_feature_database()->get_internal_data().size()
+              << std::endl;
+  }
 
   // If the aruco tracker is available, the also pass to it
   // NOTE: binocular tracking for aruco doesn't make sense as we by default have the ids
@@ -651,11 +695,19 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   timelastupdate = message.timestamp;
 
   // Debug, print our current state
+  if (glim_openvins_debug_enabled()) {
+
   PRINT_INFO("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n", state->_imu->quat()(0),
              state->_imu->quat()(1), state->_imu->quat()(2), state->_imu->quat()(3), state->_imu->pos()(0), state->_imu->pos()(1),
              state->_imu->pos()(2), distance);
+
+  }
+  if (glim_openvins_debug_enabled()) {
+
   PRINT_INFO("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n", state->_imu->bias_g()(0), state->_imu->bias_g()(1), state->_imu->bias_g()(2),
              state->_imu->bias_a()(0), state->_imu->bias_a()(1), state->_imu->bias_a()(2));
+
+  }
 
   // Debug for camera imu offset
   if (state->_options.do_calib_camera_timeoffset) {
