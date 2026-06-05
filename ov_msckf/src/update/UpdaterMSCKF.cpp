@@ -34,10 +34,50 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <string>
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+
+namespace {
+bool glim_openvins_debug_enabled() {
+  const char* v = std::getenv("GLIM_OPENVINS_DEBUG");
+  if (v == nullptr) {
+    return false;
+  }
+  const std::string value(v);
+  return value == "1" || value == "true" || value == "TRUE" || value == "debug" || value == "DEBUG";
+}
+int glim_openvins_min_msckf_features() {
+  const char* v = std::getenv("GLIM_OPENVINS_MIN_MSCKF_FEATURES");
+  if (v == nullptr) {
+    return 10;
+  }
+  try {
+    return std::max(0, std::stoi(std::string(v)));
+  } catch (...) {
+    return 10;
+  }
+}
+
+double glim_openvins_env_double(const char* name, double fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr) {
+    return fallback;
+  }
+  try {
+    return std::stod(std::string(v));
+  } catch (...) {
+    return fallback;
+  }
+}
+
+}  // namespace
 
 UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerOptions &feat_init_options) : _options(options) {
 
@@ -60,6 +100,16 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   // Return if no features
   if (feature_vec.empty())
     return;
+
+  const size_t glim_dbg_input_features = feature_vec.size();
+  size_t glim_dbg_removed_few_meas = 0;
+  size_t glim_dbg_removed_tri = 0;
+  size_t glim_dbg_removed_refine = 0;
+  size_t glim_dbg_removed_chi2 = 0;
+  size_t glim_dbg_accepted_chi2 = 0;
+  size_t glim_dbg_chi2_count = 0;
+  double glim_dbg_chi2_ratio_sum = 0.0;
+  double glim_dbg_chi2_ratio_max = 0.0;
 
   // Start timing
   boost::posix_time::ptime rT0, rT1, rT2, rT3, rT4, rT5;
@@ -86,6 +136,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Remove if we don't have enough
     if (ct_meas < 2) {
+      glim_dbg_removed_few_meas++;
       (*it0)->to_delete = true;
       it0 = feature_vec.erase(it0);
     } else {
@@ -134,6 +185,12 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Remove the feature if not a success
     if (!success_tri || !success_refine) {
+      if (!success_tri) {
+        glim_dbg_removed_tri++;
+      }
+      if (!success_refine) {
+        glim_dbg_removed_refine++;
+      }
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);
       continue;
@@ -222,7 +279,14 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Check if we should delete or not
-    if (chi2 > _options.chi2_multipler * chi2_check) {
+    const double chi2_threshold = _options.chi2_multipler * chi2_check;
+    const double chi2_ratio = chi2 / std::max(1e-12, chi2_threshold);
+    glim_dbg_chi2_count++;
+    glim_dbg_chi2_ratio_sum += chi2_ratio;
+    glim_dbg_chi2_ratio_max = std::max(glim_dbg_chi2_ratio_max, chi2_ratio);
+
+    if (chi2 > chi2_threshold) {
+      glim_dbg_removed_chi2++;
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
       // PRINT_DEBUG("featid = %d\n", feat.featid);
@@ -232,6 +296,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       // PRINT_DEBUG(ss.str().c_str());
       continue;
     }
+
+    glim_dbg_accepted_chi2++;
 
     // We are good!!! Append to our large H vector
     size_t ct_hx = 0;
@@ -254,6 +320,66 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     ct_meas += res.rows();
     it2++;
   }
+  const double chi2_ratio_mean =
+    (glim_dbg_chi2_count > 0)
+      ? (glim_dbg_chi2_ratio_sum / static_cast<double>(glim_dbg_chi2_count))
+      : 0.0;
+
+  static int glim_msckf_inner_dbg_count = 0;
+  if (glim_openvins_debug_enabled() &&
+      (glim_msckf_inner_dbg_count < 120 || glim_msckf_inner_dbg_count % 50 == 0)) {
+    std::cout << "[openvins_msckf_inner_dbg]"
+              << " input=" << glim_dbg_input_features
+              << " after_clean_tri_chi2=" << feature_vec.size()
+              << " few_meas=" << glim_dbg_removed_few_meas
+              << " tri_fail=" << glim_dbg_removed_tri
+              << " refine_fail=" << glim_dbg_removed_refine
+              << " chi2_reject=" << glim_dbg_removed_chi2
+              << " chi2_accept=" << glim_dbg_accepted_chi2
+              << " chi2_count=" << glim_dbg_chi2_count
+              << " chi2_ratio_mean=" << chi2_ratio_mean
+              << " chi2_ratio_max=" << glim_dbg_chi2_ratio_max
+              << " sigma_pix=" << _options.sigma_pix
+              << " chi2_multiplier=" << _options.chi2_multipler
+              << std::endl;
+  }
+  glim_msckf_inner_dbg_count++;
+
+  const int glim_min_msckf_features = glim_openvins_min_msckf_features();
+  const double glim_max_chi2_ratio_mean =
+    glim_openvins_env_double("GLIM_OPENVINS_MAX_CHI2_RATIO_MEAN", 2.0);
+  const double glim_max_chi2_ratio_max =
+    glim_openvins_env_double("GLIM_OPENVINS_MAX_CHI2_RATIO_MAX", 50.0);
+
+  if ((int)feature_vec.size() < glim_min_msckf_features) {
+    if (glim_openvins_debug_enabled()) {
+      std::cout << "[openvins_msckf_skip_dbg]"
+                << " reason=too_few_accepted_features"
+                << " accepted=" << feature_vec.size()
+                << " min_required=" << glim_min_msckf_features
+                << std::endl;
+    }
+    feature_vec.clear();
+    return;
+  }
+
+  if (glim_dbg_chi2_count > 0 &&
+      (chi2_ratio_mean > glim_max_chi2_ratio_mean ||
+       glim_dbg_chi2_ratio_max > glim_max_chi2_ratio_max)) {
+    if (glim_openvins_debug_enabled()) {
+      std::cout << "[openvins_msckf_skip_dbg]"
+                << " reason=bad_chi2_quality"
+                << " accepted=" << feature_vec.size()
+                << " chi2_ratio_mean=" << chi2_ratio_mean
+                << " max_allowed_mean=" << glim_max_chi2_ratio_mean
+                << " chi2_ratio_max=" << glim_dbg_chi2_ratio_max
+                << " max_allowed_max=" << glim_max_chi2_ratio_max
+                << std::endl;
+    }
+    feature_vec.clear();
+    return;
+  }
+
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // We have appended all features to our Hx_big, res_big

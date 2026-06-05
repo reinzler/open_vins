@@ -317,6 +317,16 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   trackFEATS->feed_new_camera(message);
+  static int glim_feat_dbg_count = 0;
+  if (glim_openvins_debug_enabled() &&
+      (glim_feat_dbg_count < 100 || glim_feat_dbg_count % 50 == 0)) {
+    std::cout << "[openvins_feat_dbg]"
+              << " stage=after_feed"
+              << " t=" << message.timestamp
+              << " sensors=" << message.sensor_ids.size()
+              << " db_features=" << trackFEATS->get_feature_database()->get_internal_data().size()
+              << std::endl;
+  }
 
   if (glim_track_dbg) {
     std::cout << "[openvins_track_dbg] after_tracking count=" << glim_track_dbg_count
@@ -413,7 +423,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   feats_lost = trackFEATS->get_feature_database()->features_not_containing_newer(state->_timestamp, false, true);
 
   // Don't need to get the oldest features until we reach our max number of clones
-  if ((int)state->_clones_IMU.size() > state->_options.max_clone_size || (int)state->_clones_IMU.size() > 5) {
+  if ((int)state->_clones_IMU.size() > state->_options.max_clone_size) {
     feats_marg = trackFEATS->get_feature_database()->features_containing(state->margtimestep(), false, true);
     if (trackARUCO != nullptr && message.timestamp - startup_time >= params.dt_slam_delay) {
       feats_slam = trackARUCO->get_feature_database()->features_containing(state->margtimestep(), false, true);
@@ -543,6 +553,22 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   featsup_MSCKF.insert(featsup_MSCKF.end(), feats_marg.begin(), feats_marg.end());
   featsup_MSCKF.insert(featsup_MSCKF.end(), feats_maxtracks.begin(), feats_maxtracks.end());
 
+  static int glim_feat_dbg_update_count = 0;
+  if (glim_openvins_debug_enabled() &&
+      (glim_feat_dbg_update_count < 100 || glim_feat_dbg_update_count % 50 == 0)) {
+    std::cout << "[openvins_feat_dbg]"
+              << " stage=before_msckf_update"
+              << " t=" << message.timestamp
+              << " db_features=" << trackFEATS->get_feature_database()->get_internal_data().size()
+              << " lost=" << feats_lost.size()
+              << " marg=" << feats_marg.size()
+              << " maxtracks=" << feats_maxtracks.size()
+              << " msckf_total=" << featsup_MSCKF.size()
+              << " max_msckf_in_update=" << state->_options.max_msckf_in_update
+              << std::endl;
+  }
+  glim_feat_dbg_update_count++;
+
   //===================================================================================
   // Now that we have a list of features, lets do the EKF update for MSCKF and SLAM!
   //===================================================================================
@@ -566,7 +592,35 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
+  const std::size_t glim_dbg_msckf_before_count = featsup_MSCKF.size();
+  const Eigen::Vector3d glim_dbg_p_before = state->_imu->pos();
+  const Eigen::Vector3d glim_dbg_v_before = state->_imu->vel();
+  const Eigen::Vector3d glim_dbg_bg_before = state->_imu->bias_g();
+  const Eigen::Vector3d glim_dbg_ba_before = state->_imu->bias_a();
+
   updaterMSCKF->update(state, featsup_MSCKF);
+
+  if (glim_openvins_debug_enabled()) {
+    const Eigen::Vector3d dp = state->_imu->pos() - glim_dbg_p_before;
+    const Eigen::Vector3d dv = state->_imu->vel() - glim_dbg_v_before;
+    const Eigen::Vector3d dbg = state->_imu->bias_g() - glim_dbg_bg_before;
+    const Eigen::Vector3d dba = state->_imu->bias_a() - glim_dbg_ba_before;
+
+    std::cout << "[openvins_msckf_applied_dbg]"
+              << " t=" << message.timestamp
+              << " before_candidates=" << glim_dbg_msckf_before_count
+              << " after_accepted=" << featsup_MSCKF.size()
+              << " dp_norm=" << dp.norm()
+              << " dv_norm=" << dv.norm()
+              << " dbg_norm=" << dbg.norm()
+              << " dba_norm=" << dba.norm()
+              << " p=[" << state->_imu->pos().transpose() << "]"
+              << " v=[" << state->_imu->vel().transpose() << "]"
+              << " bg=[" << state->_imu->bias_g().transpose() << "]"
+              << " ba=[" << state->_imu->bias_a().transpose() << "]"
+              << std::endl;
+  }
+
   propagator->invalidate_cache();
   rT4 = boost::posix_time::microsec_clock::local_time();
 
@@ -693,6 +747,25 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     distance += dx.norm();
   }
   timelastupdate = message.timestamp;
+
+  static int glim_health_dbg_count = 0;
+  if (glim_openvins_debug_enabled() &&
+      (glim_health_dbg_count < 40 || glim_health_dbg_count % 50 == 0)) {
+    std::cout << "[openvins_health_dbg]"
+              << " frame_t=" << message.timestamp
+              << " state_t=" << state->_timestamp
+              << " sensors=" << message.sensor_ids.size()
+              << " msckf_feats=" << featsup_MSCKF.size()
+              << " slam_feats=" << state->_features_SLAM.size()
+              << " clones=" << state->_clones_IMU.size()
+              << " p=[" << state->_imu->pos().transpose() << "]"
+              << " v=[" << state->_imu->vel().transpose() << "]"
+              << " bg=[" << state->_imu->bias_g().transpose() << "]"
+              << " ba=[" << state->_imu->bias_a().transpose() << "]"
+              << " dist=" << distance
+              << std::endl;
+  }
+  glim_health_dbg_count++;
 
   // Debug, print our current state
   if (glim_openvins_debug_enabled()) {

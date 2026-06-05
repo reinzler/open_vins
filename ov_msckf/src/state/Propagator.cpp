@@ -25,12 +25,24 @@
 #include "state/StateHelper.h"
 #include "utils/print.h"
 #include "utils/quat_ops.h"
+#include <cstdlib>
+#include <iostream>
+
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
 void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
+  if (std::getenv("GLIM_OPENVINS_DEBUG") != nullptr) {
+    std::cout << "[openvins_prop_entry] propagate_and_clone target_t=" << timestamp
+              << " state_t=" << state->_timestamp
+              << " dt=" << (timestamp - state->_timestamp)
+              << " imu_buffer=" << imu_data.size()
+              << " p=[" << state->_imu->pos().transpose() << "]"
+              << " v=[" << state->_imu->vel().transpose() << "]"
+              << std::endl;
+  }
 
   // If the difference between the current update time and state is zero
   // We should crash, as this means we would have two clones at the same time!!!!
@@ -66,6 +78,12 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   {
     std::lock_guard<std::mutex> lck(imu_data_mtx);
     prop_data = Propagator::select_imu_readings(imu_data, time0, time1);
+    if (std::getenv("GLIM_OPENVINS_DEBUG") != nullptr) {
+      std::cout << "[openvins_prop_entry] selected_imu propagate_and_clone time0=" << time0
+                << " time1=" << time1
+                << " count=" << prop_data.size()
+                << std::endl;
+    }
   }
 
   // We are going to sum up all the state transition matrices, so we can do a single large multiplication at the end
@@ -139,6 +157,15 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
 
 bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
                                       Eigen::Matrix<double, 12, 12> &covariance) {
+  if (std::getenv("GLIM_OPENVINS_DEBUG") != nullptr) {
+    std::cout << "[openvins_prop_entry] fast_state_propagate target_t=" << timestamp
+              << " state_t=" << state->_timestamp
+              << " dt=" << (timestamp - state->_timestamp)
+              << " imu_buffer=" << imu_data.size()
+              << " p=[" << state->_imu->pos().transpose() << "]"
+              << " v=[" << state->_imu->vel().transpose() << "]"
+              << std::endl;
+  }
 
   // First we will store the current calibration / estimates of the state
   if (!cache_imu_valid) {
@@ -156,6 +183,12 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
   {
     std::lock_guard<std::mutex> lck(imu_data_mtx);
     prop_data = Propagator::select_imu_readings(imu_data, time0, time1, false);
+    if (std::getenv("GLIM_OPENVINS_DEBUG") != nullptr) {
+      std::cout << "[openvins_prop_entry] selected_imu fast_state_propagate time0=" << time0
+                << " time1=" << time1
+                << " count=" << prop_data.size()
+                << std::endl;
+    }
   }
   if (prop_data.size() < 2)
     return false;
@@ -438,6 +471,8 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
   // Compute the new state mean value
   Eigen::Vector4d new_q;
   Eigen::Vector3d new_v, new_p;
+  const Eigen::Vector3d glim_dbg_old_v = state->_imu->vel();
+  const Eigen::Vector3d glim_dbg_old_p = state->_imu->pos();
   if (state->_options.integration_method == StateOptions::IntegrationMethod::ANALYTICAL) {
     predict_mean_analytic(state, dt, w_hat_avg, a_hat_avg, new_q, new_v, new_p, Xi_sum);
   } else if (state->_options.integration_method == StateOptions::IntegrationMethod::RK4) {
@@ -445,6 +480,39 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
   } else {
     predict_mean_discrete(state, dt, w_hat_avg, a_hat_avg, new_q, new_v, new_p);
   }
+
+  static int glim_predict_dbg_count = 0;
+  if (std::getenv("GLIM_OPENVINS_DEBUG") != nullptr &&
+      (glim_predict_dbg_count < 250 || glim_predict_dbg_count % 250 == 0)) {
+    const Eigen::Vector3d glim_dbg_dv = new_v - glim_dbg_old_v;
+    const Eigen::Vector3d glim_dbg_dp = new_p - glim_dbg_old_p;
+    const double glim_dbg_dt_safe = (dt > 1e-12) ? dt : 1e-12;
+    const Eigen::Vector3d glim_dbg_vdot = glim_dbg_dv / glim_dbg_dt_safe;
+
+    const Eigen::Matrix3d glim_dbg_R_GtoI = state->_imu->Rot();
+    const Eigen::Vector3d glim_dbg_acc_G = glim_dbg_R_GtoI.transpose() * a_hat_avg;
+    const Eigen::Vector3d glim_dbg_acc_minus_g = glim_dbg_acc_G - _gravity;
+
+    std::cout << "[openvins_predict_dbg]"
+              << " dt=" << dt
+              << " method=" << static_cast<int>(state->_options.integration_method)
+              << " raw_am_minus=[" << data_minus.am.transpose() << "]"
+              << " raw_am_plus=[" << data_plus.am.transpose() << "]"
+              << " bias_a=[" << state->_imu->bias_a().transpose() << "]"
+              << " a_hat_avg=[" << a_hat_avg.transpose() << "]"
+              << " acc_G=[" << glim_dbg_acc_G.transpose() << "]"
+              << " gravity=[" << _gravity.transpose() << "]"
+              << " acc_minus_g=[" << glim_dbg_acc_minus_g.transpose() << "]"
+              << " old_v=[" << glim_dbg_old_v.transpose() << "]"
+              << " new_v=[" << new_v.transpose() << "]"
+              << " dv=[" << glim_dbg_dv.transpose() << "]"
+              << " vdot=[" << glim_dbg_vdot.transpose() << "]"
+              << " old_p=[" << glim_dbg_old_p.transpose() << "]"
+              << " new_p=[" << new_p.transpose() << "]"
+              << " dp=[" << glim_dbg_dp.transpose() << "]"
+              << std::endl;
+  }
+  glim_predict_dbg_count++;
 
   // Allocate state transition and continuous-time noise Jacobian
   F = Eigen::MatrixXd::Zero(state->imu_intrinsic_size() + 15, state->imu_intrinsic_size() + 15);

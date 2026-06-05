@@ -28,10 +28,38 @@
 #include "utils/print.h"
 
 #include <boost/math/distributions/chi_squared.hpp>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+bool glim_openvins_step_gate_enabled() {
+  const char* v = std::getenv("GLIM_OPENVINS_STEP_GATE");
+  if (v == nullptr) {
+    return false;
+  }
+  const std::string value(v);
+  return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
+}
+
+double glim_openvins_env_double_statehelper(const char* name, double fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr) {
+    return fallback;
+  }
+  try {
+    return std::stod(std::string(v));
+  } catch (...) {
+    return fallback;
+  }
+}
+}  // namespace
+
+
 
 void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &order_NEW,
                                  const std::vector<std::shared_ptr<Type>> &order_OLD, const Eigen::MatrixXd &Phi,
@@ -183,6 +211,74 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
 
   // Calculate our delta and update all our active states
   Eigen::VectorXd dx = K * res;
+
+  if (glim_openvins_step_gate_enabled()) {
+    const double dx_norm = dx.norm();
+    const double max_dx = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DX", 0.50);
+
+    if (dx_norm > max_dx) {
+      std::cout << "[openvins_state_update_skip_dbg]"
+                << " reason=large_total_dx"
+                << " dx_norm=" << dx_norm
+                << " max_dx=" << max_dx
+                << " dx_rows=" << dx.rows()
+                << std::endl;
+      return;
+    }
+  }
+
+
+  if (glim_openvins_step_gate_enabled() && state && state->_imu) {
+    int imu_idx = -1;
+    int cursor = 0;
+
+    for (const auto& var : H_order) {
+      if (var == state->_imu) {
+        imu_idx = cursor;
+        break;
+      }
+      cursor += var->size();
+    }
+
+    if (imu_idx >= 0 && imu_idx + 15 <= dx.rows()) {
+      const double dtheta_norm = dx.segment(imu_idx + 0, 3).norm();
+      const double dp_norm = dx.segment(imu_idx + 3, 3).norm();
+      const double dv_norm = dx.segment(imu_idx + 6, 3).norm();
+      const double dbg_norm = dx.segment(imu_idx + 9, 3).norm();
+      const double dba_norm = dx.segment(imu_idx + 12, 3).norm();
+
+      const double max_dtheta = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DTHETA", 0.35);
+      const double max_dp = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DP", 0.75);
+      const double max_dv = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DV", 0.75);
+      const double max_dbg = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DBG", 0.05);
+      const double max_dba = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DBA", 0.25);
+
+      const bool reject =
+        dtheta_norm > max_dtheta ||
+        dp_norm > max_dp ||
+        dv_norm > max_dv ||
+        dbg_norm > max_dbg ||
+        dba_norm > max_dba;
+
+      if (reject) {
+        std::cout << "[openvins_state_update_skip_dbg]"
+                  << " reason=large_ekf_step"
+                  << " dtheta_norm=" << dtheta_norm
+                  << " max_dtheta=" << max_dtheta
+                  << " dp_norm=" << dp_norm
+                  << " max_dp=" << max_dp
+                  << " dv_norm=" << dv_norm
+                  << " max_dv=" << max_dv
+                  << " dbg_norm=" << dbg_norm
+                  << " max_dbg=" << max_dbg
+                  << " dba_norm=" << dba_norm
+                  << " max_dba=" << max_dba
+                  << std::endl;
+        return;
+      }
+    }
+  }
+
   for (size_t i = 0; i < state->_variables.size(); i++) {
     state->_variables.at(i)->update(dx.block(state->_variables.at(i)->id(), 0, state->_variables.at(i)->size(), 1));
   }
