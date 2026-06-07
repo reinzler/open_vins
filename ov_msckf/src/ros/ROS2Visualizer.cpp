@@ -644,6 +644,8 @@ void ROS2Visualizer::publish_state() {
 }
 
 void ROS2Visualizer::publish_images() {
+  return;
+
 
   // Return if we have already visualized
   if (_app->get_state() == nullptr)
