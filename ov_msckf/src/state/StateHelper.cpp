@@ -46,6 +46,18 @@ bool glim_openvins_step_gate_enabled() {
   return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
 }
 
+bool glim_openvins_skip_invalid_ekf_update_enabled() {
+  const char* v = std::getenv("GLIM_OPENVINS_SKIP_INVALID_EKF_UPDATE");
+  if (v == nullptr) {
+    return true;
+  }
+  const std::string value(v);
+  if (value == "0" || value == "false" || value == "FALSE" || value == "no" || value == "NO") {
+    return false;
+  }
+  return value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES";
+}
+
 double glim_openvins_env_double_statehelper(const char* name, double fallback) {
   const char* v = std::getenv(name);
   if (v == nullptr) {
@@ -56,6 +68,20 @@ double glim_openvins_env_double_statehelper(const char* name, double fallback) {
   } catch (...) {
     return fallback;
   }
+}
+
+double covariance_min_diagonal(const Eigen::MatrixXd& cov) {
+  if (cov.rows() == 0) {
+    return 0.0;
+  }
+  return cov.diagonal().minCoeff();
+}
+
+bool covariance_is_valid(const Eigen::MatrixXd& cov, double min_diag = -1e-10) {
+  if (!cov.allFinite()) {
+    return false;
+  }
+  return covariance_min_diagonal(cov) >= min_diag;
 }
 }  // namespace
 
@@ -190,27 +216,19 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   Eigen::MatrixXd K = M_a * Sinv.selfadjointView<Eigen::Upper>();
   // Eigen::MatrixXd K = M_a * S.inverse();
 
-  // Update Covariance
-  state->_Cov.triangularView<Eigen::Upper>() -= K * M_a.transpose();
-  state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
-  // Cov -= K * M_a.transpose();
-  // Cov = 0.5*(Cov+Cov.transpose());
-
-  // We should check if we are not positive semi-definitate (i.e. negative diagionals is not s.p.d)
-  Eigen::VectorXd diags = state->_Cov.diagonal();
-  bool found_neg = false;
-  for (int i = 0; i < diags.rows(); i++) {
-    if (diags(i) < 0.0) {
-      PRINT_WARNING(RED "StateHelper::EKFUpdate() - diagonal at %d is %.2f\n" RESET, i, diags(i));
-      found_neg = true;
+  Eigen::VectorXd dx = K * res;
+  if (!dx.allFinite()) {
+    if (glim_openvins_skip_invalid_ekf_update_enabled()) {
+      std::cout << "[openvins_ekf_update_skip_dbg]"
+                << " reason=non_finite_dx"
+                << " dx_norm=" << dx.norm()
+                << " rows=" << dx.rows()
+                << std::endl;
+      return;
     }
-  }
-  if (found_neg) {
+    PRINT_ERROR(RED "StateHelper::EKFUpdate() - non-finite dx\n" RESET);
     std::exit(EXIT_FAILURE);
   }
-
-  // Calculate our delta and update all our active states
-  Eigen::VectorXd dx = K * res;
 
   if (glim_openvins_step_gate_enabled()) {
     const double dx_norm = dx.norm();
@@ -227,42 +245,54 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     }
   }
 
-
   if (glim_openvins_step_gate_enabled() && state && state->_imu) {
-    int imu_idx = -1;
-    int cursor = 0;
-
-    for (const auto& var : H_order) {
-      if (var == state->_imu) {
-        imu_idx = cursor;
-        break;
-      }
-      cursor += var->size();
-    }
-
-    if (imu_idx >= 0 && imu_idx + 15 <= dx.rows()) {
-      const double dtheta_norm = dx.segment(imu_idx + 0, 3).norm();
-      const double dp_norm = dx.segment(imu_idx + 3, 3).norm();
-      const double dv_norm = dx.segment(imu_idx + 6, 3).norm();
-      const double dbg_norm = dx.segment(imu_idx + 9, 3).norm();
-      const double dba_norm = dx.segment(imu_idx + 12, 3).norm();
+    const int imu_id = state->_imu->id();
+    if (imu_id + 15 <= dx.rows()) {
+      const double dtheta_norm = dx.segment(imu_id + 0, 3).norm();
+      const double dp_norm = dx.segment(imu_id + 3, 3).norm();
+      const double dv_norm = dx.segment(imu_id + 6, 3).norm();
+      const double dbg_norm = dx.segment(imu_id + 9, 3).norm();
+      const double dba_norm = dx.segment(imu_id + 12, 3).norm();
 
       const double max_dtheta = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DTHETA", 0.35);
       const double max_dp = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DP", 0.75);
       const double max_dv = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DV", 0.75);
       const double max_dbg = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DBG", 0.05);
       const double max_dba = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_DBA", 0.25);
+      const double max_clone = glim_openvins_env_double_statehelper("GLIM_OPENVINS_MAX_UPDATE_CLONE", 1.0);
+
+      double clone_dx_norm = 0.0;
+      for (const auto &var : state->_variables) {
+        if (var == state->_imu) {
+          continue;
+        }
+        clone_dx_norm = std::max(clone_dx_norm, dx.segment(var->id(), var->size()).norm());
+      }
 
       const bool reject =
         dtheta_norm > max_dtheta ||
         dp_norm > max_dp ||
         dv_norm > max_dv ||
         dbg_norm > max_dbg ||
-        dba_norm > max_dba;
+        dba_norm > max_dba ||
+        clone_dx_norm > max_clone;
 
       if (reject) {
+        std::string reason = "large_ekf_step";
+        if (dtheta_norm > max_dtheta) {
+          reason = "large_current_pose_dx";
+        } else if (dp_norm > max_dp) {
+          reason = "large_current_pose_dx";
+        } else if (dv_norm > max_dv) {
+          reason = "large_current_velocity_dx";
+        } else if (dbg_norm > max_dbg || dba_norm > max_dba) {
+          reason = "large_bias_dx";
+        } else if (clone_dx_norm > max_clone) {
+          reason = "large_clone_state_dx";
+        }
+
         std::cout << "[openvins_state_update_skip_dbg]"
-                  << " reason=large_ekf_step"
+                  << " reason=" << reason
                   << " dtheta_norm=" << dtheta_norm
                   << " max_dtheta=" << max_dtheta
                   << " dp_norm=" << dp_norm
@@ -273,11 +303,41 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
                   << " max_dbg=" << max_dbg
                   << " dba_norm=" << dba_norm
                   << " max_dba=" << max_dba
+                  << " clone_dx_norm=" << clone_dx_norm
+                  << " max_clone=" << max_clone
                   << std::endl;
         return;
       }
     }
   }
+
+  const Eigen::MatrixXd Cov_backup = state->_Cov;
+  Eigen::MatrixXd Cov_new = Cov_backup;
+  Cov_new.triangularView<Eigen::Upper>() -= K * M_a.transpose();
+  Cov_new = Cov_new.selfadjointView<Eigen::Upper>();
+
+  const double min_diag = covariance_min_diagonal(Cov_new);
+  if (!covariance_is_valid(Cov_new)) {
+    if (glim_openvins_skip_invalid_ekf_update_enabled()) {
+      std::cout << "[openvins_ekf_update_skip_dbg]"
+                << " reason=invalid_covariance"
+                << " min_diag=" << min_diag
+                << " dx_norm=" << dx.norm()
+                << " rows=" << dx.rows()
+                << std::endl;
+      return;
+    }
+
+    Eigen::VectorXd diags = Cov_new.diagonal();
+    for (int i = 0; i < diags.rows(); i++) {
+      if (diags(i) < 0.0) {
+        PRINT_WARNING(RED "StateHelper::EKFUpdate() - diagonal at %d is %.2f\n" RESET, i, diags(i));
+      }
+    }
+    std::exit(EXIT_FAILURE);
+  }
+
+  state->_Cov = Cov_new;
 
   for (size_t i = 0; i < state->_variables.size(); i++) {
     state->_variables.at(i)->update(dx.block(state->_variables.at(i)->id(), 0, state->_variables.at(i)->size(), 1));

@@ -144,8 +144,12 @@ protected:
   /// Simulator (is nullptr if we are not sim'ing)
   std::shared_ptr<Simulator> _sim;
 
+  // Image transport must outlive image_transport::Publisher members.
+  std::unique_ptr<image_transport::ImageTransport> it_;
+
   // Our publishers
   image_transport::Publisher it_pub_tracks, it_pub_loop_img_depth, it_pub_loop_img_depth_color;
+  bool publish_image_tracks = true;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_poseimu;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odomimu;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_pathimu;

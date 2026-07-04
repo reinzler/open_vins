@@ -31,18 +31,66 @@
 #include "utils/print.h"
 #include "utils/sensor_data.h"
 
+#include <cstdlib>
+#include <iostream>
+
+namespace {
+cv::Mat rosimage_to_gray8(const sensor_msgs::msg::Image::ConstSharedPtr &msg) {
+  cv_bridge::CvImageConstPtr cv_ptr;
+  if (msg->encoding == sensor_msgs::image_encodings::MONO8 || msg->encoding == "8UC1") {
+    cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::MONO8);
+    return cv_ptr->image.clone();
+  }
+  if (msg->encoding == sensor_msgs::image_encodings::RGB8) {
+    cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::RGB8);
+    cv::Mat gray;
+    cv::cvtColor(cv_ptr->image, gray, cv::COLOR_RGB2GRAY);
+    return gray;
+  }
+  if (msg->encoding == sensor_msgs::image_encodings::BGR8) {
+    cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+    cv::Mat gray;
+    cv::cvtColor(cv_ptr->image, gray, cv::COLOR_BGR2GRAY);
+    return gray;
+  }
+  cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::MONO8);
+  return cv_ptr->image.clone();
+}
+}  // namespace
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+namespace {
+
+bool openvins_image_publish_enabled(const std::shared_ptr<rclcpp::Node> &node) {
+  const char *env = std::getenv("OPENVINS_DISABLE_IMAGE_PUBLISH");
+  if (env != nullptr) {
+    const std::string value(env);
+    if (value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES") {
+      return false;
+    }
+  }
+  bool publish = true;
+  if (node->has_parameter("publish_image_tracks")) {
+    node->get_parameter("publish_image_tracks", publish);
+  }
+  return publish;
+}
+
+} // namespace
+
 ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_ptr<VioManager> app, std::shared_ptr<Simulator> sim)
     : _node(node), _app(app), _sim(sim), thread_update_running(false) {
+
+  publish_image_tracks = openvins_image_publish_enabled(node);
 
   // Setup our transform broadcaster
   mTfBr = std::make_shared<tf2_ros::TransformBroadcaster>(node);
 
-  // Create image transport
-  image_transport::ImageTransport it(node);
+  // Create image transport (must persist for the lifetime of image publishers)
+  it_ = std::make_unique<image_transport::ImageTransport>(node);
 
   // Setup pose and path publisher
   pub_poseimu = node->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("poseimu", 2);
@@ -63,8 +111,10 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
   PRINT_DEBUG("Publishing: %s\n", pub_points_sim->get_topic_name());
 
   // Our tracking image
-  it_pub_tracks = it.advertise("trackhist", 2);
-  PRINT_DEBUG("Publishing: %s\n", it_pub_tracks.getTopic().c_str());
+  if (publish_image_tracks) {
+    it_pub_tracks = it_->advertise("trackhist", 2);
+    PRINT_DEBUG("Publishing: %s\n", it_pub_tracks.getTopic().c_str());
+  }
 
   // Groundtruth publishers
   pub_posegt = node->create_publisher<geometry_msgs::msg::PoseStamped>("posegt", 2);
@@ -77,8 +127,8 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
   pub_loop_point = node->create_publisher<sensor_msgs::msg::PointCloud>("loop_feats", 2);
   pub_loop_extrinsic = node->create_publisher<nav_msgs::msg::Odometry>("loop_extrinsic", 2);
   pub_loop_intrinsics = node->create_publisher<sensor_msgs::msg::CameraInfo>("loop_intrinsics", 2);
-  it_pub_loop_img_depth = it.advertise("loop_depth", 2);
-  it_pub_loop_img_depth_color = it.advertise("loop_depth_colored", 2);
+  it_pub_loop_img_depth = it_->advertise("loop_depth", 2);
+  it_pub_loop_img_depth_color = it_->advertise("loop_depth_colored", 2);
 
   // option to enable publishing of global to IMU transformation
   if (node->has_parameter("publish_global_to_imu_tf")) {
@@ -148,7 +198,7 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
   }
 
   // Start thread for the image publishing
-  if (_app->get_params().use_multi_threading_pubs) {
+  if (publish_image_tracks && _app->get_params().use_multi_threading_pubs) {
     std::thread thread([&] {
       rclcpp::Rate loop_rate(20);
       while (rclcpp::ok()) {
@@ -173,6 +223,7 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
   sub_imu = _node->create_subscription<sensor_msgs::msg::Imu>(topic_imu, rclcpp::SensorDataQoS(),
                                                               std::bind(&ROS2Visualizer::callback_inertial, this, std::placeholders::_1));
   PRINT_INFO("subscribing to IMU: %s\n", topic_imu.c_str());
+  std::cerr << "[openvins_standalone_dbg] subscribing imu topic=" << topic_imu << std::endl;
 
   // Logic for sync stereo subscriber
   // https://answers.ros.org/question/96346/subscribe-to-two-image_raws-with-one-function/?answer=96491#post-id-96491
@@ -214,6 +265,7 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
           cam_topic, 10, [this, i](const sensor_msgs::msg::Image::SharedPtr msg0) { callback_monocular(msg0, i); });
       subs_cam.push_back(sub);
       PRINT_INFO("subscribing to cam (mono): %s\n", cam_topic.c_str());
+      std::cerr << "[openvins_standalone_dbg] subscribing cam" << i << " topic=" << cam_topic << std::endl;
     }
   }
 }
@@ -505,10 +557,10 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
   }
   camera_last_timestamp[cam_id0] = timestamp;
 
-  // Get the image
-  cv_bridge::CvImageConstPtr cv_ptr;
+  // Get the image (UAV bag uses rgb8; convert explicitly for correct grayscale)
+  cv::Mat gray;
   try {
-    cv_ptr = cv_bridge::toCvShare(msg0, sensor_msgs::image_encodings::MONO8);
+    gray = rosimage_to_gray8(msg0);
   } catch (cv_bridge::Exception &e) {
     PRINT_ERROR("cv_bridge exception: %s", e.what());
     return;
@@ -516,16 +568,16 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
 
   // Create the measurement
   ov_core::CameraData message;
-  message.timestamp = cv_ptr->header.stamp.sec + cv_ptr->header.stamp.nanosec * 1e-9;
+  message.timestamp = timestamp;
   message.sensor_ids.push_back(cam_id0);
-  message.images.push_back(cv_ptr->image.clone());
+  message.images.push_back(gray);
 
   // Load the mask if we are using it, else it is empty
   // TODO: in the future we should get this from external pixel segmentation
   if (_app->get_params().use_mask) {
     message.masks.push_back(_app->get_params().masks.at(cam_id0));
   } else {
-    message.masks.push_back(cv::Mat::zeros(cv_ptr->image.rows, cv_ptr->image.cols, CV_8UC1));
+    message.masks.push_back(cv::Mat::zeros(gray.rows, gray.cols, CV_8UC1));
   }
 
   // append it to our queue of images
@@ -546,18 +598,11 @@ void ROS2Visualizer::callback_stereo(const sensor_msgs::msg::Image::ConstSharedP
   camera_last_timestamp[cam_id0] = timestamp;
 
   // Get the image
-  cv_bridge::CvImageConstPtr cv_ptr0;
+  cv::Mat gray0;
+  cv::Mat gray1;
   try {
-    cv_ptr0 = cv_bridge::toCvShare(msg0, sensor_msgs::image_encodings::MONO8);
-  } catch (cv_bridge::Exception &e) {
-    PRINT_ERROR("cv_bridge exception: %s", e.what());
-    return;
-  }
-
-  // Get the image
-  cv_bridge::CvImageConstPtr cv_ptr1;
-  try {
-    cv_ptr1 = cv_bridge::toCvShare(msg1, sensor_msgs::image_encodings::MONO8);
+    gray0 = rosimage_to_gray8(msg0);
+    gray1 = rosimage_to_gray8(msg1);
   } catch (cv_bridge::Exception &e) {
     PRINT_ERROR("cv_bridge exception: %s", e.what());
     return;
@@ -565,11 +610,11 @@ void ROS2Visualizer::callback_stereo(const sensor_msgs::msg::Image::ConstSharedP
 
   // Create the measurement
   ov_core::CameraData message;
-  message.timestamp = cv_ptr0->header.stamp.sec + cv_ptr0->header.stamp.nanosec * 1e-9;
+  message.timestamp = timestamp;
   message.sensor_ids.push_back(cam_id0);
   message.sensor_ids.push_back(cam_id1);
-  message.images.push_back(cv_ptr0->image.clone());
-  message.images.push_back(cv_ptr1->image.clone());
+  message.images.push_back(gray0);
+  message.images.push_back(gray1);
 
   // Load the mask if we are using it, else it is empty
   // TODO: in the future we should get this from external pixel segmentation
@@ -577,9 +622,8 @@ void ROS2Visualizer::callback_stereo(const sensor_msgs::msg::Image::ConstSharedP
     message.masks.push_back(_app->get_params().masks.at(cam_id0));
     message.masks.push_back(_app->get_params().masks.at(cam_id1));
   } else {
-    // message.masks.push_back(cv::Mat(cv_ptr0->image.rows, cv_ptr0->image.cols, CV_8UC1, cv::Scalar(255)));
-    message.masks.push_back(cv::Mat::zeros(cv_ptr0->image.rows, cv_ptr0->image.cols, CV_8UC1));
-    message.masks.push_back(cv::Mat::zeros(cv_ptr1->image.rows, cv_ptr1->image.cols, CV_8UC1));
+    message.masks.push_back(cv::Mat::zeros(gray0.rows, gray0.cols, CV_8UC1));
+    message.masks.push_back(cv::Mat::zeros(gray1.rows, gray1.cols, CV_8UC1));
   }
 
   // append it to our queue of images
@@ -644,8 +688,8 @@ void ROS2Visualizer::publish_state() {
 }
 
 void ROS2Visualizer::publish_images() {
-  return;
-
+  if (!publish_image_tracks || it_ == nullptr)
+    return;
 
   // Return if we have already visualized
   if (_app->get_state() == nullptr)

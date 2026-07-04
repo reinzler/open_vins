@@ -277,6 +277,11 @@ struct VioManagerOptions {
           camera_intrinsics.at(i)->set_value(cam_calib);
         }
         camera_extrinsics.insert({i, cam_eigen});
+
+        std::cerr << "[openvins_standalone_dbg] cam" << i << " T_imu_cam loaded"
+                  << " q_ItoC=[" << cam_eigen(0) << ", " << cam_eigen(1) << ", " << cam_eigen(2) << ", " << cam_eigen(3) << "]"
+                  << " p_IinC=[" << cam_eigen(4) << ", " << cam_eigen(5) << ", " << cam_eigen(6) << "]"
+                  << std::endl;
       }
       parser->parse_config("use_mask", use_mask);
       if (use_mask) {

@@ -20,6 +20,8 @@
  */
 
 #include <memory>
+#include <cstdlib>
+#include <iostream>
 
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h"
@@ -42,8 +44,21 @@ std::shared_ptr<ROS1Visualizer> viz;
 std::shared_ptr<ROS2Visualizer> viz;
 #endif
 
+#if ROS_AVAILABLE == 2
+namespace {
+void openvins_standalone_dbg(const std::string &msg) {
+  std::cerr << "[openvins_standalone_dbg] " << msg << std::endl;
+  std::cerr.flush();
+}
+} // namespace
+#endif
+
 // Main function
 int main(int argc, char **argv) {
+
+#if ROS_AVAILABLE == 2
+  openvins_standalone_dbg("entered main");
+#endif
 
   // Ensure we have a path, if the user passes it then we should use it
   std::string config_path = "unset_path_to_config.yaml";
@@ -59,11 +74,16 @@ int main(int argc, char **argv) {
 #elif ROS_AVAILABLE == 2
   // Launch our ros node
   rclcpp::init(argc, argv);
+  openvins_standalone_dbg("rclcpp init ok");
   rclcpp::NodeOptions options;
   options.allow_undeclared_parameters(true);
   options.automatically_declare_parameters_from_overrides(true);
   auto node = std::make_shared<rclcpp::Node>("run_subscribe_msckf", options);
+  openvins_standalone_dbg(std::string("node created name=") + node->get_fully_qualified_name());
+  const char *domain_id = std::getenv("ROS_DOMAIN_ID");
+  openvins_standalone_dbg(std::string("ROS_DOMAIN_ID=") + (domain_id != nullptr ? domain_id : "(unset)"));
   node->get_parameter<std::string>("config_path", config_path);
+  openvins_standalone_dbg("config_path=" + config_path);
 #endif
 
   // Load the config
@@ -72,6 +92,7 @@ int main(int argc, char **argv) {
   parser->set_node_handler(nh);
 #elif ROS_AVAILABLE == 2
   parser->set_node(node);
+  openvins_standalone_dbg("parser created");
 #endif
 
   // Verbosity
@@ -83,16 +104,27 @@ int main(int argc, char **argv) {
   VioManagerOptions params;
   params.print_and_load(parser);
   params.use_multi_threading_subs = true;
+#if ROS_AVAILABLE == 2
+  openvins_standalone_dbg("VioManagerOptions loaded max_cameras=" + std::to_string(params.state_options.num_cameras) +
+                          " use_stereo=" + std::to_string(params.use_stereo));
+#endif
   sys = std::make_shared<VioManager>(params);
 #if ROS_AVAILABLE == 1
   viz = std::make_shared<ROS1Visualizer>(nh, sys);
   viz->setup_subscribers(parser);
 #elif ROS_AVAILABLE == 2
+  openvins_standalone_dbg("VioManager created");
   viz = std::make_shared<ROS2Visualizer>(node, sys);
+  openvins_standalone_dbg("ROS2Visualizer created");
+  openvins_standalone_dbg("setup_subscribers begin");
   viz->setup_subscribers(parser);
+  openvins_standalone_dbg("setup_subscribers end");
 #endif
 
   // Ensure we read in all parameters required
+#if ROS_AVAILABLE == 2
+  openvins_standalone_dbg(std::string("parser successful=") + (parser->successful() ? "true" : "false"));
+#endif
   if (!parser->successful()) {
     PRINT_ERROR(RED "unable to parse all parameters, please fix\n" RESET);
     std::exit(EXIT_FAILURE);
@@ -100,6 +132,9 @@ int main(int argc, char **argv) {
 
   // Spin off to ROS
   PRINT_DEBUG("done...spinning to ros\n");
+#if ROS_AVAILABLE == 2
+  openvins_standalone_dbg("spin/executor begin");
+#endif
 #if ROS_AVAILABLE == 1
   // ros::spin();
   ros::AsyncSpinner spinner(0);

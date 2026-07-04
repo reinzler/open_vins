@@ -44,11 +44,17 @@ launch_args = [
         name="save_total_state",
         default_value="false",
         description="record the total state with calibration and features to a txt file",
+    ),
+    DeclareLaunchArgument(
+        name="use_sim_time",
+        default_value="false",
+        description="use /clock for bag replay",
     )
 ]
 
 def launch_setup(context):
-    config_path = LaunchConfiguration("config_path").perform(context)
+    user_config_path = LaunchConfiguration("config_path").perform(context)
+    config_path = user_config_path
     if not config_path:
         configs_dir = os.path.join(get_package_share_directory("ov_msckf"), "config")
         available_configs = os.listdir(configs_dir)
@@ -74,19 +80,27 @@ def launch_setup(context):
                         config_path)
                     )
             ]
+
+    node_params = [
+        {"verbosity": LaunchConfiguration("verbosity")},
+        {"save_total_state": LaunchConfiguration("save_total_state")},
+        {"config_path": config_path},
+        {"use_sim_time": LaunchConfiguration("use_sim_time")},
+    ]
+    # When using a custom config_path, let estimator_config.yaml own camera settings.
+    if not user_config_path:
+        node_params.extend([
+            {"use_stereo": LaunchConfiguration("use_stereo")},
+            {"max_cameras": LaunchConfiguration("max_cameras")},
+        ])
+
     node1 = Node(
         package="ov_msckf",
         executable="run_subscribe_msckf",
         condition=IfCondition(LaunchConfiguration("ov_enable")),
         namespace=LaunchConfiguration("namespace"),
         output='screen',
-        parameters=[
-            {"verbosity": LaunchConfiguration("verbosity")},
-            {"use_stereo": LaunchConfiguration("use_stereo")},
-            {"max_cameras": LaunchConfiguration("max_cameras")},
-            {"save_total_state": LaunchConfiguration("save_total_state")},
-            {"config_path": config_path},
-        ],
+        parameters=node_params,
     )
 
     node2 = Node(
